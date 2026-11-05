@@ -115,6 +115,7 @@ def inspect_system():
         "nrpt_hijacked": False,
         "conflicting_tasks": False,
         "conflicting_process_running": False,
+        "watchdog_active": False,
     }
 
     if info["binary_exists"]:
@@ -148,11 +149,13 @@ def inspect_system():
     except Exception:
         pass
 
-    # Check conflicting scheduled tasks
+    # Check scheduled tasks & watchdog
     try:
         res_tasks = subprocess.run(["schtasks", "/query", "/fo", "CSV"], capture_output=True, text=True)
-        if any(marker in res_tasks.stdout for marker in ["ag_dns", "Antigravity Watchdog"]):
+        if any(marker in res_tasks.stdout for marker in ["ag_dns", "AG Unlocker"]):
             info["conflicting_tasks"] = True
+        if "NoGravity Watchdog" in res_tasks.stdout or "NoVPN Antigravity Watchdog" in res_tasks.stdout:
+            info["watchdog_active"] = True
     except Exception:
         pass
 
@@ -217,6 +220,13 @@ def print_banner(info):
     else:
         nrpt_str = f"{GREEN}[ ЧИСТО ] DNS обрабатывается сетевым адаптером / VPN-клиентом{RESET}"
     print(f"  ● DNS маршрутизация   : {nrpt_str}")
+
+    # 6. Autonomous Watchdog
+    if info["watchdog_active"]:
+        wd_str = f"{GREEN}[ АКТИВНА ] Служба планировщика удерживает патч при авто-обновлениях{RESET}"
+    else:
+        wd_str = f"{DIM}[ ОТКЛЮЧЕНА ] Фоновая авто-служба не установлена{RESET}"
+    print(f"  ● Авто-служба Watchdog: {wd_str}")
 
     print(f"{CYAN}{DIM}  -----------------------------------------------------------------------{RESET}")
 
@@ -357,29 +367,52 @@ def clean_conflicts():
     print(f"\n{GREEN}{BOLD}[ГОТОВО] Все конфликтующие сетевые перехваты успешно сняты.{RESET}")
 
 
+def remove_watchdog(silent: bool = False):
+    """Remove autonomous watchdog task from Task Scheduler."""
+    if is_admin():
+        subprocess.run(["schtasks", "/delete", "/tn", "NoGravity Watchdog", "/f"], capture_output=True)
+        subprocess.run(["schtasks", "/delete", "/tn", "NoVPN Antigravity Watchdog", "/f"], capture_output=True)
+    else:
+        subprocess.run([
+            "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+            'Start-Process schtasks -ArgumentList \'/delete /tn "NoGravity Watchdog" /f\' -Verb RunAs -Wait; '
+            'Start-Process schtasks -ArgumentList \'/delete /tn "NoVPN Antigravity Watchdog" /f\' -Verb RunAs -Wait'
+        ], capture_output=True)
+    if not silent:
+        print(f"  {GREEN}[+] Автономная служба авто-сохранения (NoGravity Watchdog) удалена из планировщика.{RESET}")
+
+
 def restore_factory_original():
-    """Restore virgin language_server.exe from original backup."""
+    """Restore virgin language_server.exe from original backup and remove autonomous watchdog."""
     ls = get_ls_path()
     bak = ls.with_suffix(".exe.bak_original")
 
-    print(f"\n{BOLD}{YELLOW}[*] Откат Antigravity к заводскому оригиналу...{RESET}")
+    print(f"\n{BOLD}{YELLOW}[*] Заводской откат Antigravity к оригиналу...{RESET}")
     if not bak.exists():
         print(f"{RED}[-] Оригинальный резервный бэкап {bak.name} не найден!{RESET}")
         return
 
-    choice = input(f"{WHITE}Вы уверены, что хотите вернуть непатченный оригинальный бинарник? (y/N): {RESET}").strip().lower()
+    choice = input(f"{WHITE}Вернуть заводской бинарник и полностью удалить авто-службу Watchdog? (y/N): {RESET}").strip().lower()
     if choice != "y":
         return
 
+    # 1. Remove autonomous watchdog service so it will never re-apply the patch
+    remove_watchdog()
+
+    # 2. Stop running Antigravity processes
     subprocess.run(["taskkill", "/F", "/IM", "language_server.exe"], capture_output=True)
     subprocess.run(["taskkill", "/F", "/IM", "Antigravity.exe"], capture_output=True)
     time.sleep(1)
 
+    # 3. Restore virgin original binary
     try:
         shutil.copy2(bak, ls)
-        print(f"{GREEN}[+] Бинарник language_server.exe успешно восстановлен из заводского бэкапа!{RESET}")
+        print(f"  {GREEN}[+] Бинарник language_server.exe успешно восстановлен из заводского бэкапа!{RESET}")
     except Exception as e:
-        print(f"{RED}[-] Ошибка восстановления: {e}{RESET}")
+        print(f"  {RED}[-] Ошибка восстановления: {e}{RESET}")
+        return
+
+    print(f"\n{GREEN}{BOLD}[ГОТОВО] Antigravity возвращен к заводскому виду: оригинал на месте, авто-служба удалена.{RESET}")
 
 
 def run_diagnostics():
@@ -480,6 +513,12 @@ def main():
         elif flag in ["--revert", "-r"]:
             restore_factory_original()
             return
+        elif flag in ["--unwatch", "-u"]:
+            remove_watchdog()
+            return
+        elif flag in ["--watch", "-w"]:
+            install_watchdog()
+            return
         elif flag in ["--diag", "-d"]:
             run_diagnostics()
             return
@@ -493,12 +532,13 @@ def main():
         info = inspect_system()
         print_banner(info)
 
+        wd_action = "Отключить авто-службу Watchdog" if info["watchdog_active"] else "Установить авто-службу Watchdog"
         print(f"""  {BOLD}{WHITE}[ МЕНЮ ДЕЙСТВИЙ ]{RESET}
   {CYAN}[1]{RESET} {BOLD}Активировать NoGravity{RESET} (Снять геоблок + восстановить нативный прокси)
   {CYAN}[2]{RESET} Очистить конфликты (Остановить сторонние демоны, снять задачи и NRPT)
-  {CYAN}[3]{RESET} Заводской откат Antigravity (Восстановить исходный language_server.exe)
+  {CYAN}[3]{RESET} Заводской откат Antigravity (Восстановить оригинал + удалить авто-службу)
   {CYAN}[4]{RESET} Запустить диагностику Google AI эндпоинтов и сети
-  {CYAN}[5]{RESET} Установить авто-сохранение патча при обновлениях (NoGravity Watchdog)
+  {CYAN}[5]{RESET} {wd_action} (удержание патча при обновлениях)
   {CYAN}[0]{RESET} Выход
 """)
         choice = input(f"  {BOLD}{WHITE}Выберите пункт [0-5]: {RESET}").strip()
@@ -517,7 +557,10 @@ def main():
             run_diagnostics()
             input(f"\n{DIM}Нажмите Enter для продолжения...{RESET}")
         elif choice == "5":
-            install_watchdog()
+            if info["watchdog_active"]:
+                remove_watchdog()
+            else:
+                install_watchdog()
             input(f"\n{DIM}Нажмите Enter для продолжения...{RESET}")
         elif choice == "0":
             print(f"\n{GREEN}Выход.{RESET}")
