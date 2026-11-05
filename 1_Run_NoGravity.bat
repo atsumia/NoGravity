@@ -1,59 +1,49 @@
-﻿@echo off
-setlocal EnableDelayedExpansion
-chcp 65001 >nul
+@echo off
+setlocal
 cd /d "%~dp0"
-title NoGravity - Autonomous Doctor & Environment Patcher
+title NoGravity - Antigravity Doctor
 
-:: Check Administrator privileges
 net session >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [*] Запрос прав администратора...
     powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
     exit /b
 )
 
-:: Locate Python adaptively on any PC
 set "PY="
-where py.exe >nul 2>&1
-if %errorlevel% equ 0 (
-    for /f "delims=" %%I in ('where py.exe 2^>nul') do if not defined PY set "PY=%%I -3"
-)
-if not defined PY (
-    where python.exe >nul 2>&1
-    if %errorlevel% equ 0 (
-        for /f "delims=" %%I in ('where python.exe 2^>nul') do if not defined PY set "PY=%%I"
-    )
-)
-if not defined PY (
-    for /d %%D in ("%LOCALAPPDATA%\Programs\Python\Python3*" "%ProgramFiles%\Python3*" "%ProgramFiles(x86)%\Python3*") do (
-        if not defined PY if exist "%%~D\python.exe" set "PY=%%~D\python.exe"
-    )
-)
+where py.exe >nul 2>&1 && for /f "delims=" %%i in ('where py.exe 2^>nul') do if not defined PY set "PY=%%i -3"
+if defined PY goto :RUN
 
-if not defined PY (
-    color 0C
-    echo.
-    echo ======================================================================
-    echo  [ОШИБКА] Python 3 не обнаружен на этом компьютере!
-    echo ======================================================================
-    echo  Для работы NoGravity требуется установленный Python 3 (3.8+).
-    echo.
-    echo  Быстрая установка через Windows Terminal / PowerShell:
-    echo      winget install Python.Python.3.11
-    echo.
-    echo  Или скачайте с официального сайта:
-    echo      https://www.python.org/downloads/
-    echo ======================================================================
-    echo.
-    pause
-    exit /b 1
-)
+where python.exe >nul 2>&1 && for /f "delims=" %%i in ('where python.exe 2^>nul') do if not defined PY set "PY=%%i"
+if defined PY goto :RUN
 
-:: Run NoGravity Interactive Engine
+if exist "%LOCALAPPDATA%\Programs\Python\Python311\python.exe" set "PY=%LOCALAPPDATA%\Programs\Python\Python311\python.exe" & goto :RUN
+if exist "%LOCALAPPDATA%\Programs\Python\Python310\python.exe" set "PY=%LOCALAPPDATA%\Programs\Python\Python310\python.exe" & goto :RUN
+if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" set "PY=%LOCALAPPDATA%\Programs\Python\Python312\python.exe" & goto :RUN
+if exist "%LOCALAPPDATA%\Programs\Python\Python313\python.exe" set "PY=%LOCALAPPDATA%\Programs\Python\Python313\python.exe" & goto :RUN
+if exist "%ProgramFiles%\Python311\python.exe" set "PY=%ProgramFiles%\Python311\python.exe" & goto :RUN
+if exist "%ProgramFiles%\Python310\python.exe" set "PY=%ProgramFiles%\Python310\python.exe" & goto :RUN
+if exist "%ProgramFiles%\Python312\python.exe" set "PY=%ProgramFiles%\Python312\python.exe" & goto :RUN
+if exist "%ProgramFiles%\Python313\python.exe" set "PY=%ProgramFiles%\Python313\python.exe" & goto :RUN
+
+color 0C
+echo.
+echo ======================================================================
+echo  [ERROR] Python 3 was not detected on this system!
+echo ======================================================================
+echo  NoGravity requires Python 3 (3.8 or newer).
+echo  Install it via Windows Terminal / PowerShell:
+echo      winget install Python.Python.3.11
+echo  Or download from: https://www.python.org/downloads/
+echo ======================================================================
+echo.
+pause
+exit /b 1
+
+:RUN
 %PY% "%~dp0nogravity.py" %*
-
 if %errorlevel% neq 0 (
     echo.
-    echo [!] Программа завершилась с кодом: %errorlevel%
+    echo [!] Process exited with code: %errorlevel%
     pause
 )
+exit /b %errorlevel%
