@@ -151,7 +151,7 @@ def inspect_system():
     # Check conflicting scheduled tasks
     try:
         res_tasks = subprocess.run(["schtasks", "/query", "/fo", "CSV"], capture_output=True, text=True)
-        if any(marker in res_tasks.stdout for marker in ["Unlocker", "ag_dns", "AG Unlocker"]):
+        if any(marker in res_tasks.stdout for marker in ["ag_dns", "Antigravity Watchdog"]):
             info["conflicting_tasks"] = True
     except Exception:
         pass
@@ -347,8 +347,7 @@ def clean_conflicts():
     # 4. Remove NRPT DNS hijack rules
     ps_nrpt = """
     Get-DnsClientNrptRule | Where-Object { 
-        $_.Comment -like '*AG_UNLOCKER*' -or 
-        $_.Namespace -contains 'cloudcode-pa.googleapis.com' -or 
+        $_.Namespace -like '*googleapis.com*' -or 
         $_.IPsecCARestriction -like '*127.0.0.53*' 
     } | Remove-DnsClientNrptRule -Force
     """

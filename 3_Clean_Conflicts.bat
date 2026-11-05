@@ -1,4 +1,4 @@
-﻿@echo off
+@echo off
 setlocal EnableDelayedExpansion
 chcp 65001 >nul
 cd /d "%~dp0"
@@ -41,7 +41,7 @@ if defined PY (
     schtasks /delete /tn "NoVPN Antigravity Watchdog" /f >nul 2>&1
     reg delete "HKCU\Environment" /v "AG_LS_PROXY" /f >nul 2>&1
     reg delete "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment" /v "AG_LS_PROXY" /f >nul 2>&1
-    powershell -NoProfile -Command "Get-DnsClientNrptRule | Where-Object { $_.Comment -like '*AG_UNLOCKER*' -or $_.Namespace -contains 'cloudcode-pa.googleapis.com' } | Remove-DnsClientNrptRule -Force" >nul 2>&1
+    powershell -NoProfile -Command "Get-DnsClientNrptRule | Where-Object { $_.Namespace -like '*googleapis.com*' -or $_.IPsecCARestriction -like '*127.0.0.53*' } | Remove-DnsClientNrptRule -Force" >nul 2>&1
     echo [+] Очистка завершена напрямую.
 )
 
