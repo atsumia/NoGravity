@@ -4,10 +4,9 @@
 ================================================================================
 NoGravity • Universal Doctor & Environment Patcher for Google Antigravity
 ================================================================================
-Autonomous open-source patcher & diagnostics suite for Google Antigravity.
-Neutralizes Protobuf geo-restriction gating, restores native proxy routing,
-removes conflicting local DNS hooks/hijacks, and ensures rock-solid compatibility
-with any VPN, SOCKS5, or HTTPS proxy solution (Happ, V2Ray, Clash, Sing-box, etc.).
+Local patcher and diagnostics suite for Google Antigravity.
+Reports server location errors separately from the local binary patch.
+A binary patch cannot change the service's server-side location decision.
 ================================================================================
 """
 
@@ -20,6 +19,9 @@ import winreg
 import urllib.request
 import urllib.error
 import json
+import hashlib
+import re
+import argparse
 from pathlib import Path
 
 # Force UTF-8 encoding on Windows console
@@ -50,6 +52,9 @@ ELEVATE_EXE = Path(os.path.expandvars(r"%LOCALAPPDATA%\Programs\antigravity\reso
 
 def get_ls_path() -> Path:
     """Locate language_server.exe in standard or custom paths."""
+    custom = os.environ.get("NOGRAVITY_LS_PATH")
+    if custom:
+        return Path(custom)
     if DEFAULT_LS_PATH.exists():
         return DEFAULT_LS_PATH
     # Search common alternative locations
@@ -62,6 +67,39 @@ def get_ls_path() -> Path:
         if alt.exists():
             return alt
     return DEFAULT_LS_PATH
+
+
+def get_cli_path() -> Path:
+    custom = os.environ.get("NOGRAVITY_CLI_PATH")
+    if custom:
+        return Path(custom)
+    default = Path(os.path.expandvars(r"%LOCALAPPDATA%\agy\bin\agy.exe"))
+    if default.exists():
+        return default
+    found = shutil.which("agy.exe")
+    return Path(found) if found else default
+
+
+def get_targets(target="all"):
+    paths = {"desktop": get_ls_path(), "cli": get_cli_path()}
+    if target != "all":
+        return [(target, paths[target])]
+    return [(name, path) for name, path in paths.items() if path.exists()]
+
+
+def apply_targets(target="all", silent=False):
+    targets = get_targets(target)
+    if not targets:
+        if not silent:
+            print("Antigravity Desktop и CLI не найдены. Задайте NOGRAVITY_LS_PATH или NOGRAVITY_CLI_PATH.")
+        return False
+    success = True
+    for name, path in targets:
+        if not silent:
+            print(f"\n[{name}] {path}")
+        if not apply_nogravity_patch(silent=silent, path=path):
+            success = False
+    return success
 
 
 def is_admin() -> bool:
@@ -79,8 +117,9 @@ def run_elevated(cmd_list):
         return subprocess.run(cmd_list, capture_output=True, text=True)
     if ELEVATE_EXE.exists():
         return subprocess.run([str(ELEVATE_EXE)] + cmd_list, capture_output=True, text=True)
-    ps_args = " ".join([f'"{c}"' for c in cmd_list[1:]])
-    ps_cmd = f'Start-Process -FilePath "{cmd_list[0]}" -ArgumentList \'{ps_args}\' -Verb RunAs -Wait'
+    ps_args = subprocess.list2cmdline(cmd_list[1:]).replace("'", "''")
+    ps_exe = cmd_list[0].replace("'", "''")
+    ps_cmd = f"Start-Process -FilePath '{ps_exe}' -ArgumentList '{ps_args}' -Verb RunAs -WindowStyle Hidden -Wait"
     return subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd], capture_output=True, text=True)
 
 
@@ -99,7 +138,33 @@ def get_egress_info() -> str:
         return "Не удалось определить (офлайн или блокировка внешних запросов)"
 
 
-def inspect_system():
+def recent_location_error(log_path=None):
+    """Return only location evidence from the log, never tokens or raw log lines."""
+    path = Path(log_path) if log_path else Path(os.path.expandvars(r"%APPDATA%\Antigravity\logs\language_server.log"))
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - 512 * 1024))
+            lines = handle.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if "LOCATION_NOT_ELIGIBLE" not in line:
+            continue
+        location = re.search(r"Detected location:\s*([A-Z]{2})", line)
+        timestamp = re.search(r"\b[WIE](\d{4}\s+\d{2}:\d{2}:\d{2})", line)
+        return {"reason": "LOCATION_NOT_ELIGIBLE", "detected_location": location.group(1) if location else None,
+                "log_time": timestamp.group(1) if timestamp else None}
+    return None
+
+
+def http_verdict(status, body=""):
+    if any(marker in body.lower() for marker in ["location_not_eligible", "user location is not supported", "your location is not eligible"]):
+        return "Серверный геоблок"
+    return "Ответ HTTP; доступ аккаунта не проверен"
+
+
+def inspect_system(target="all"):
     ls = get_ls_path()
     bak = ls.with_suffix(".exe.bak_original")
 
@@ -112,10 +177,14 @@ def inspect_system():
         "ag_ls_proxy_count": 0,
         "https_proxy_count": 0,
         "env_ag_ls_proxy": None,
+        "env_ag_ls_proxy_machine": None,
+        "inspection_errors": [],
         "nrpt_hijacked": False,
         "conflicting_tasks": False,
         "conflicting_process_running": False,
         "watchdog_active": False,
+        "server_location_error": recent_location_error(),
+        "targets": [],
     }
 
     if info["binary_exists"]:
@@ -125,47 +194,74 @@ def inspect_system():
             info["ineligible_count"] = data.count(b"ineligible")
             info["ag_ls_proxy_count"] = data.count(b"AG_LS_PROXY")
             info["https_proxy_count"] = data.count(b"https_proxy")
-        except Exception:
-            pass
+        except OSError:
+            info["inspection_errors"].append("binary")
+
+    for name, path in get_targets(target):
+        entry = {"name": name, "path": str(path), "exists": path.exists(),
+                 "has_backup": path.with_suffix(".exe.bak_original").exists(),
+                 "ineligible_count": 0, "inexigible_count": 0, "ag_ls_proxy_count": 0}
+        try:
+            binary = path.read_bytes()
+            for marker, key in [(b"ineligible", "ineligible_count"), (b"inexigible", "inexigible_count"), (b"AG_LS_PROXY", "ag_ls_proxy_count")]:
+                entry[key] = binary.count(marker)
+        except OSError:
+            info["inspection_errors"].append(name + "_binary")
+        info["targets"].append(entry)
 
     # Check environment variable
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment", 0, winreg.KEY_READ) as key:
-            info["env_ag_ls_proxy"] = winreg.QueryValueEx(key, "AG_LS_PROXY")[0]
+            info["env_ag_ls_proxy"] = bool(winreg.QueryValueEx(key, "AG_LS_PROXY")[0])
     except FileNotFoundError:
         pass
     except Exception:
+        info["inspection_errors"].append("user_environment")
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment", 0, winreg.KEY_READ) as key:
+            info["env_ag_ls_proxy_machine"] = bool(winreg.QueryValueEx(key, "AG_LS_PROXY")[0])
+    except FileNotFoundError:
         pass
+    except OSError:
+        info["inspection_errors"].append("machine_environment")
 
     # Check NRPT DNS hijacks (e.g. 127.0.0.53 rule)
     try:
         res = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Command", "Get-DnsClientNrptRule | Select-Object -ExpandProperty Namespace"],
+            ["powershell.exe", "-NoProfile", "-Command", "$ErrorActionPreference = 'Stop'; Get-DnsClientNrptRule | Where-Object { ($_.NameServers -contains '127.0.0.53') -and ($_.Namespace -like '*googleapis.com*') } | Select-Object -ExpandProperty Namespace"],
             capture_output=True,
             text=True,
+            timeout=10,
         )
+        if res.returncode != 0:
+            info["inspection_errors"].append("nrpt")
         if any("cloudcode-pa.googleapis.com" in l for l in res.stdout.splitlines()):
             info["nrpt_hijacked"] = True
     except Exception:
-        pass
+        info["inspection_errors"].append("nrpt")
 
     # Check scheduled tasks & watchdog
     try:
-        res_tasks = subprocess.run(["schtasks", "/query", "/fo", "CSV"], capture_output=True, text=True)
-        if any(marker in res_tasks.stdout for marker in ["ag_dns", "AG Unlocker"]):
+        res_tasks = subprocess.run(["schtasks", "/query", "/fo", "CSV"], capture_output=True, text=True, timeout=10)
+        if res_tasks.returncode != 0:
+            info["inspection_errors"].append("scheduled_tasks")
+        if any(marker in res_tasks.stdout for marker in ["ag_dns", "AG Unlocker", "NoVPN Antigravity Watchdog"]):
             info["conflicting_tasks"] = True
         if "NoGravity Watchdog" in res_tasks.stdout or "NoVPN Antigravity Watchdog" in res_tasks.stdout:
             info["watchdog_active"] = True
     except Exception:
-        pass
+        info["inspection_errors"].append("scheduled_tasks")
 
     # Check conflicting processes (e.g. ag_dns.exe)
     try:
-        res_proc = subprocess.run(["tasklist", "/fi", "imagename eq ag_dns.exe"], capture_output=True, text=True)
+        res_proc = subprocess.run(["tasklist", "/fi", "imagename eq ag_dns.exe"], capture_output=True, text=True, timeout=10)
+        if res_proc.returncode != 0:
+            info["inspection_errors"].append("processes")
         if "ag_dns.exe" in res_proc.stdout:
             info["conflicting_process_running"] = True
     except Exception:
-        pass
+        info["inspection_errors"].append("processes")
 
     return info
 
@@ -179,7 +275,7 @@ def print_banner(info):
   ██║╚██╗██║██║   ██║██║   ██║██╔══██╗██╔══██║╚██╗ ██╔╝██║   ██║     ╚██╔╝  
   ██║ ╚████║╚██████╔╝╚██████╔╝██║  ██║██║  ██║ ╚████╔╝ ██║   ██║      ██║   
   ╚═╝  ╚═══╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝  ╚═══╝  ╚═╝   ╚═╝      ╚═╝   
-        {WHITE}Autonomous Antigravity Doctor & Environment Patcher v2.0{CYAN}
+        {WHITE}Antigravity Desktop & CLI Doctor v2.1.0{CYAN}
   {DIM}======================================================================={RESET}""")
 
     print(f"{BOLD}{WHITE}  [ СИСТЕМНЫЙ ДАШБОРД СОВМЕСТИМОСТИ ]{RESET}")
@@ -190,21 +286,29 @@ def print_banner(info):
     else:
         bin_str = f"{GREEN}[ НАЙДЕН ] {info['ls_path']}{RESET}"
     print(f"  ● Языковой сервер     : {bin_str}")
+    for entry in info["targets"]:
+        state = "локальный патч" if entry["inexigible_count"] else "без патча"
+        if not entry["exists"]:
+            state = "не найден"
+        print(f"  ● {entry['name']:<18}: {state} — {entry['path']}")
 
     # 2. Regional Protobuf Gating
     if info["inexigible_count"] > 0:
-        reg_str = f"{GREEN}[ СНЯТО ] {info['inexigible_count']} точек нейтрализации (inexigible){RESET}"
+        reg_str = f"{YELLOW}[ ЛОКАЛЬНЫЙ ПАТЧ ] {info['inexigible_count']} строк inexigible; доступ сервера не подтверждён{RESET}"
     elif info["ineligible_count"] > 0:
-        reg_str = f"{RED}[ АКТИВЕН БЛОК ] Аккаунты РФ блокируются сервером ({info['ineligible_count']} точек ineligible){RESET}"
+        reg_str = f"{WHITE}[ БЕЗ ЛОКАЛЬНОГО ПАТЧА ] {info['ineligible_count']} строк ineligible{RESET}"
     else:
         reg_str = f"{YELLOW}[ НЕИЗВЕСТНО ] Сигнатуры Protobuf не найдены{RESET}"
-    print(f"  ● Региональный лок    : {reg_str}")
+    print(f"  ● Локальный патч      : {reg_str}")
+    if info["server_location_error"]:
+        evidence = info["server_location_error"]
+        print(f"  ● Последний геоблок   : {RED}Google: {evidence['reason']}, регион {evidence['detected_location']}, лог {evidence['log_time']}{RESET}")
 
     # 3. Proxy routing hook
     if info["ag_ls_proxy_count"] > 0:
-        hook_str = f"{YELLOW}[ ПЕРЕХВАЧЕН ] Вшита привязка к локальному AG_LS_PROXY:53129{RESET}"
+        hook_str = f"{YELLOW}[ СТОРОННЯЯ СТРОКА ] AG_LS_PROXY обнаружен в бинарнике{RESET}"
     else:
-        hook_str = f"{GREEN}[ ЧИСТО ] Нативный https_proxy (стандартная маршрутизация туннеля){RESET}"
+        hook_str = f"{WHITE}[ НЕ НАЙДЕН ] AG_LS_PROXY отсутствует; маршрут VPN проверяется отдельно{RESET}"
     print(f"  ● Сетевой перехват    : {hook_str}")
 
     # 4. Conflicting background services
@@ -218,106 +322,81 @@ def print_banner(info):
     if info["nrpt_hijacked"]:
         nrpt_str = f"{YELLOW}[ ПЕРЕХВАТ 127.0.0.53 ] DNS запросы CloudCode направляются на локальный резолвер{RESET}"
     else:
-        nrpt_str = f"{GREEN}[ ЧИСТО ] DNS обрабатывается сетевым адаптером / VPN-клиентом{RESET}"
+        nrpt_str = f"{WHITE}[ НЕ НАЙДЕН ] Правило CloudCode → 127.0.0.53 не обнаружено{RESET}"
     print(f"  ● DNS маршрутизация   : {nrpt_str}")
 
     # 6. Autonomous Watchdog
     if info["watchdog_active"]:
-        wd_str = f"{GREEN}[ АКТИВНА ] Служба планировщика удерживает патч при авто-обновлениях{RESET}"
+        wd_str = f"{WHITE}[ ЗАРЕГИСТРИРОВАНА ] Патч проверяется при входе в Windows{RESET}"
     else:
         wd_str = f"{DIM}[ ОТКЛЮЧЕНА ] Фоновая авто-служба не установлена{RESET}"
     print(f"  ● Авто-служба Watchdog: {wd_str}")
+    if info["inspection_errors"]:
+        print(f"  {YELLOW}Не удалось проверить: {', '.join(info['inspection_errors'])}. Статус этих проверок неизвестен.{RESET}")
 
     print(f"{CYAN}{DIM}  -----------------------------------------------------------------------{RESET}")
 
 
-def apply_nogravity_patch(clean_first: bool = True):
-    """Apply NoGravity patch: byte neutralization + restore clean proxy env."""
-    ls = get_ls_path()
+def patched_bytes(data: bytes) -> bytes:
+    """Apply only the equal-length local flag patch; never resize an executable."""
+    if not data.startswith(b"MZ"):
+        raise ValueError("Файл не является Windows executable.")
+    if b"AG_LS_PROXY" in data:
+        raise ValueError("Обнаружен сторонний AG_LS_PROXY. Восстановите оригинал этой версии Antigravity; замена на https_proxy повреждает exe.")
+    if b"ineligible" not in data and b"inexigible" not in data:
+        raise ValueError("Сигнатура патча не найдена: эта версия не поддерживается.")
+    result = data.replace(b"ineligible", b"inexigible")
+    if len(result) != len(data):
+        raise ValueError("Изменился размер executable; запись запрещена.")
+    return result
+
+
+def apply_nogravity_patch(silent: bool = False, path=None) -> bool:
+    """Patch a closed application, preserving the original for each version."""
+    ls = Path(path) if path is not None else get_ls_path()
     bak = ls.with_suffix(".exe.bak_original")
-
-    if clean_first:
-        clean_conflicts()
-
-    print(f"\n{BOLD}{CYAN}[*] Применение патча NoGravity...{RESET}")
-
-    if not ls.exists():
-        print(f"{RED}[-] Файл {ls} не найден!{RESET}")
-        return
-
-    # Check if Antigravity or language server is currently running
-    res_ls = subprocess.run(["tasklist", "/fi", "imagename eq language_server.exe"], capture_output=True, text=True)
-    if "language_server.exe" in res_ls.stdout:
-        print(f"{YELLOW}[!] Antigravity запущен. Для записи патча процесс language_server.exe должен быть закрыт.{RESET}")
-        choice = input(f"{WHITE}Завершить процесс language_server.exe сейчас? (y/N): {RESET}").strip().lower()
-        if choice == "y":
-            subprocess.run(["taskkill", "/F", "/IM", "language_server.exe"], capture_output=True)
-            subprocess.run(["taskkill", "/F", "/IM", "Antigravity.exe"], capture_output=True)
-            time.sleep(1)
-        else:
-            print(f"{YELLOW}[*] Попытка применить патч без остановки...{RESET}")
-
-    # Create backup if not present
-    if not bak.exists():
-        try:
-            shutil.copy2(ls, bak)
-            print(f"  {GREEN}[+] Создан оригинальный резервный бэкап: {bak.name}{RESET}")
-        except Exception as e:
-            print(f"  {YELLOW}[!] Предупреждение при создании бэкапа: {e}{RESET}")
-
-    # Read binary
-    try:
-        data = bytearray(ls.read_bytes())
-    except PermissionError:
-        print(f"{RED}[-] Ошибка доступа: файл заблокирован. Закройте приложение Antigravity и повторите запуск.{RESET}")
-        return
-
-    # 1. ineligible -> inexigible (neutralize Protobuf account check)
-    c_ineligible = data.count(b"ineligible")
-    if c_ineligible > 0:
-        data = data.replace(b"ineligible", b"inexigible")
-        print(f"  {GREEN}[+] Protobuf геоблок нейтрализован: {c_ineligible} вхождений ineligible -> inexigible{RESET}")
-    else:
-        print(f"  {GREEN}[=] Protobuf геоблок уже нейтрализован ({data.count(b'inexigible')} точек inexigible){RESET}")
-
-    # 2. AG_LS_PROXY -> https_proxy (revert custom proxy hooks to native HTTPS proxy)
-    c_ag_proxy = data.count(b"AG_LS_PROXY")
-    if c_ag_proxy > 0:
-        data = data.replace(b"AG_LS_PROXY", b"https_proxy")
-        print(f"  {GREEN}[+] Сетевой хук снят: {c_ag_proxy} вхождений AG_LS_PROXY -> https_proxy{RESET}")
-    else:
-        print(f"  {GREEN}[=] Сетевая конфигурация бинарника чиста (нативный https_proxy){RESET}")
-
-    # Atomic write
     tmp_path = ls.with_suffix(".exe.tmp")
     try:
-        tmp_path.write_bytes(data)
-        shutil.move(str(tmp_path), str(ls))
-        print(f"  {GREEN}[+] language_server.exe успешно пропатчен и сохранен!{RESET}")
-    except Exception as e:
-        print(f"{RED}[-] Не удалось записать файл: {e}{RESET}")
+        data = ls.read_bytes()
+        result = patched_bytes(data)
+        if result == data:
+            if not silent:
+                print(f"{YELLOW}[=] Локальный патч уже присутствует. Доступ сервера проверяется отдельно через --diag.{RESET}")
+            return True
+        processes = subprocess.run(["tasklist", "/fo", "CSV", "/nh"], capture_output=True, text=True, timeout=10)
+        if processes.returncode != 0:
+            raise RuntimeError("Не удалось проверить запущенные процессы; запись отменена.")
+        names = {line.split(',')[0].strip('"').lower() for line in processes.stdout.splitlines()}
+        blocked = {ls.name.lower()}
+        if ls.name.lower() == "language_server.exe":
+            blocked.add("antigravity.exe")
+        if names & blocked:
+            raise RuntimeError(f"Закройте {ls.name} перед применением патча.")
+        if bak.exists() and bak.read_bytes() != data:
+            old = bak.read_bytes()
+            archive = ls.with_name(ls.name + "." + hashlib.sha256(old).hexdigest() + ".bak_original")
+            if not archive.exists():
+                shutil.copy2(bak, archive)
+        shutil.copy2(ls, bak)
+        tmp_path.write_bytes(result)
+        os.replace(tmp_path, ls)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as e:
+        if not silent:
+            print(f"{RED}[-] Патч не применён: {e}{RESET}")
         if tmp_path.exists():
             tmp_path.unlink()
-        return
-
-    # Remove conflicting registry proxy variable if left behind
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment", 0, winreg.KEY_SET_VALUE) as key:
-            winreg.DeleteValue(key, "AG_LS_PROXY")
-            print(f"  {GREEN}[+] Переменная AG_LS_PROXY удалена из реестра пользователя{RESET}")
-    except FileNotFoundError:
-        pass
-    except Exception:
-        pass
-
-    os.environ.pop("AG_LS_PROXY", None)
-
-    print(f"\n{GREEN}{BOLD}[ГОТОВО] Патч NoGravity успешно применен! Теперь Antigravity свободно работает через любой VPN.{RESET}")
+        return False
+    if not silent:
+        print(f"{GREEN}[ГОТОВО] Локальный патч применён, размер exe сохранён. Серверный LOCATION_NOT_ELIGIBLE этим не снимается.{RESET}")
+    return True
 
 
 def clean_conflicts():
     """Remove background DNS hijackers, conflicting scheduled tasks, and NRPT rules."""
     print(f"\n{BOLD}{CYAN}[*] Очистка конфликтующих хуков и сторонних служб...{RESET}")
+    if not is_admin():
+        print(f"{RED}[-] Для очистки системных правил запустите 3_Clean_Conflicts.bat от администратора.{RESET}")
+        return False
 
     # 1. Stop background processes
     subprocess.run(["taskkill", "/F", "/IM", "ag_dns.exe"], capture_output=True)
@@ -357,62 +436,84 @@ def clean_conflicts():
     # 4. Remove NRPT DNS hijack rules
     ps_nrpt = """
     Get-DnsClientNrptRule | Where-Object { 
-        $_.Namespace -like '*googleapis.com*' -or 
-        $_.IPsecCARestriction -like '*127.0.0.53*' 
+        ($_.Namespace -like '*googleapis.com*') -and
+        ($_.NameServers -contains '127.0.0.53')
     } | Remove-DnsClientNrptRule -Force
     """
     run_elevated(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_nrpt])
     print(f"  {GREEN}[+] Правила NRPT перехвата DNS (127.0.0.53) очищены{RESET}")
 
-    print(f"\n{GREEN}{BOLD}[ГОТОВО] Все конфликтующие сетевые перехваты успешно сняты.{RESET}")
+    remaining = inspect_system()
+    if remaining["inspection_errors"] or remaining["nrpt_hijacked"] or remaining["conflicting_tasks"] or remaining["conflicting_process_running"] or remaining["env_ag_ls_proxy"] or remaining["env_ag_ls_proxy_machine"]:
+        print(f"{RED}[-] Остались конфликтующие настройки. Очистка не завершена.{RESET}")
+        return False
+    print(f"\n{GREEN}{BOLD}[ГОТОВО] Проверка известных конфликтов завершена.{RESET}")
+    return True
 
 
 def remove_watchdog(silent: bool = False):
-    """Remove autonomous watchdog task from Task Scheduler."""
-    if is_admin():
-        subprocess.run(["schtasks", "/delete", "/tn", "NoGravity Watchdog", "/f"], capture_output=True)
-        subprocess.run(["schtasks", "/delete", "/tn", "NoVPN Antigravity Watchdog", "/f"], capture_output=True)
-    else:
-        subprocess.run([
-            "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-            'Start-Process schtasks -ArgumentList \'/delete /tn "NoGravity Watchdog" /f\' -Verb RunAs -Wait; '
-            'Start-Process schtasks -ArgumentList \'/delete /tn "NoVPN Antigravity Watchdog" /f\' -Verb RunAs -Wait'
-        ], capture_output=True)
+    """Delete and verify removal of the known watchdog tasks."""
+    command = """
+    $ErrorActionPreference = 'Stop';
+    foreach ($name in @('NoGravity Watchdog', 'NoVPN Antigravity Watchdog')) {
+        Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false;
+        if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) { throw 'Watchdog task still exists' }
+    }
+    """
+    result = subprocess.run(["powershell.exe", "-NoProfile", "-Command", command], capture_output=True, text=True, timeout=15)
     if not silent:
-        print(f"  {GREEN}[+] Автономная служба авто-сохранения (NoGravity Watchdog) удалена из планировщика.{RESET}")
+        if result.returncode == 0:
+            print("Watchdog удалён; отсутствие задач проверено.")
+        else:
+            print("Не удалось удалить Watchdog. Повторите от администратора.")
+    return result.returncode == 0
 
 
-def restore_factory_original():
+def restore_factory_original(path=None):
     """Restore virgin language_server.exe from original backup and remove autonomous watchdog."""
-    ls = get_ls_path()
+    ls = Path(path) if path is not None else get_ls_path()
     bak = ls.with_suffix(".exe.bak_original")
 
     print(f"\n{BOLD}{YELLOW}[*] Заводской откат Antigravity к оригиналу...{RESET}")
     if not bak.exists():
         print(f"{RED}[-] Оригинальный резервный бэкап {bak.name} не найден!{RESET}")
-        return
+        return False
+
+    try:
+        original = bak.read_bytes()
+        current = ls.read_bytes()
+        if current != original and current != patched_bytes(original):
+            print(f"{RED}[-] Бэкап не соответствует текущему бинарнику. Откат отменён; переустановите текущую версию Antigravity.{RESET}")
+            return False
+    except (OSError, ValueError) as e:
+        print(f"{RED}[-] Не удалось проверить бэкап: {e}{RESET}")
+        return False
 
     choice = input(f"{WHITE}Вернуть заводской бинарник и полностью удалить авто-службу Watchdog? (y/N): {RESET}").strip().lower()
     if choice != "y":
-        return
+        return False
 
     # 1. Remove autonomous watchdog service so it will never re-apply the patch
-    remove_watchdog()
+    if not remove_watchdog():
+        return False
 
     # 2. Stop running Antigravity processes
-    subprocess.run(["taskkill", "/F", "/IM", "language_server.exe"], capture_output=True)
-    subprocess.run(["taskkill", "/F", "/IM", "Antigravity.exe"], capture_output=True)
+    subprocess.run(["taskkill", "/F", "/IM", ls.name], capture_output=True, timeout=10)
+    if ls.name.lower() == "language_server.exe":
+        subprocess.run(["taskkill", "/F", "/IM", "Antigravity.exe"], capture_output=True, timeout=10)
     time.sleep(1)
 
     # 3. Restore virgin original binary
     try:
         shutil.copy2(bak, ls)
-        print(f"  {GREEN}[+] Бинарник language_server.exe успешно восстановлен из заводского бэкапа!{RESET}")
+        print(f"  {GREEN}[+] Бинарник {ls.name} успешно восстановлен из заводского бэкапа!{RESET}")
     except Exception as e:
         print(f"  {RED}[-] Ошибка восстановления: {e}{RESET}")
-        return
+        return False
 
     print(f"\n{GREEN}{BOLD}[ГОТОВО] Antigravity возвращен к заводскому виду: оригинал на месте, авто-служба удалена.{RESET}")
+
+    return True
 
 
 def run_diagnostics():
@@ -420,7 +521,11 @@ def run_diagnostics():
     print(f"\n{BOLD}{CYAN}[*] Комплексная диагностика эндпоинтов Google AI и сети...{RESET}")
 
     egress = get_egress_info()
-    print(f"  {WHITE}● Текущий внешний узел : {CYAN}{egress}{RESET}")
+    print(f"  {WHITE}● Внешний IP (геобаза ipinfo, не определение Google): {CYAN}{egress}{RESET}")
+    evidence = recent_location_error()
+    if evidence:
+        print(f"  {RED}● Последний ответ в логе Google: {evidence['reason']}, регион {evidence['detected_location']}, лог {evidence['log_time']}{RESET}")
+    print("  Проверка корня HTTP подтверждает только соединение. 401/403/404 не подтверждают доступ к моделям.")
 
     endpoints = [
         ("CloudCode PA (Daily)", "https://daily-cloudcode-pa.googleapis.com"),
@@ -441,21 +546,16 @@ def run_diagnostics():
             with urllib.request.urlopen(req, timeout=5) as res:
                 dur = int((time.time() - start_t) * 1000)
                 status_code = res.status
-                verdict = f"{GREEN}Доступен{RESET}"
+                verdict = http_verdict(status_code)
                 print(f"  {WHITE}{name:<24}{RESET} | {status_code:<15} | {dur:<7} ms | {verdict}")
         except urllib.error.HTTPError as e:
             dur = int((time.time() - start_t) * 1000)
-            if e.code in [401, 403, 404]:
-                try:
-                    err_body = e.read().decode("utf-8", errors="ignore")
-                    if "LOCATION_NOT_ELIGIBLE" in err_body or "User location is not supported" in err_body:
-                        verdict = f"{RED}Геоблок (RU / Cloudflare WARP){RESET}"
-                    else:
-                        verdict = f"{GREEN}Доступен ({e.code}){RESET}"
-                except Exception:
-                    verdict = f"{YELLOW}HTTP {e.code}{RESET}"
-            else:
-                verdict = f"{YELLOW}HTTP {e.code}{RESET}"
+            try:
+                verdict = http_verdict(e.code, e.read(64 * 1024).decode("utf-8", errors="replace"))
+            except OSError:
+                verdict = f"HTTP {e.code}; тело ответа не прочитано"
+            finally:
+                e.close()
             print(f"  {WHITE}{name:<24}{RESET} | {e.code:<15} | {dur:<7} ms | {verdict}")
         except Exception as e:
             dur = int((time.time() - start_t) * 1000)
@@ -465,12 +565,19 @@ def run_diagnostics():
 
 
 def install_watchdog():
-    """Install lightweight watchdog task ensuring patch persistence across Antigravity auto-updates."""
+    """Check both installations at logon with the source or portable executable."""
     print(f"\n{BOLD}{CYAN}[*] Установка автономного NoGravity Watchdog...{RESET}")
     script_path = Path(__file__).resolve()
+    if getattr(sys, "frozen", False):
+        task_exe = "powershell.exe"
+        launch = f"Start-Process -FilePath '{sys.executable.replace(chr(39), chr(39) * 2)}' -ArgumentList '--apply-silent' -WindowStyle Hidden -Wait"
+        task_args = subprocess.list2cmdline(["-NoProfile", "-WindowStyle", "Hidden", "-Command", launch])
+    else:
+        task_exe = str(Path(sys.executable).with_name("pythonw.exe"))
+        task_args = subprocess.list2cmdline([str(script_path), "--apply-silent"])
 
     ps_install = f"""
-    $a = New-ScheduledTaskAction -Execute 'pythonw.exe' -Argument '\"{script_path}\" --apply-silent';
+    $a = New-ScheduledTaskAction -Execute '{task_exe.replace(chr(39), chr(39) * 2)}' -Argument '{task_args.replace(chr(39), chr(39) * 2)}';
     $t = New-ScheduledTaskTrigger -AtLogOn;
     $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries;
     Register-ScheduledTask -TaskName 'NoGravity Watchdog' -Action $a -Trigger $t -Settings $s -Force;
@@ -478,63 +585,51 @@ def install_watchdog():
     res = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_install], capture_output=True, text=True)
     if res.returncode == 0:
         print(f"{GREEN}[+] Задача 'NoGravity Watchdog' успешно зарегистрирована в планировщике!{RESET}")
-        print(f"    (При каждом входе в систему и после авто-обновлений Antigravity патч поддерживается автоматически).")
+        print("    При входе в Windows проверяется локальный патч Desktop и CLI; обновления не отслеживаются.")
+        return True
     else:
         print(f"{RED}[-] Ошибка регистрации задачи: {res.stderr}{RESET}")
+        return False
 
 
 def main():
-    if len(sys.argv) > 1:
-        flag = sys.argv[1].lower()
-        if flag in ["--apply", "-a"]:
-            clean_conflicts()
-            apply_nogravity_patch(clean_first=False)
-            return
-        elif flag == "--apply-silent":
-            ls = get_ls_path()
-            if ls.exists():
-                try:
-                    data = bytearray(ls.read_bytes())
-                    changed = False
-                    if b"ineligible" in data:
-                        data = data.replace(b"ineligible", b"inexigible")
-                        changed = True
-                    if b"AG_LS_PROXY" in data:
-                        data = data.replace(b"AG_LS_PROXY", b"https_proxy")
-                        changed = True
-                    if changed:
-                        ls.write_bytes(data)
-                except Exception:
-                    pass
-            return
-        elif flag in ["--clean", "-c"]:
-            clean_conflicts()
-            return
-        elif flag in ["--revert", "-r"]:
-            restore_factory_original()
-            return
-        elif flag in ["--unwatch", "-u"]:
-            remove_watchdog()
-            return
-        elif flag in ["--watch", "-w"]:
-            install_watchdog()
-            return
-        elif flag in ["--diag", "-d"]:
-            run_diagnostics()
-            return
-        elif flag in ["--status", "-s"]:
-            info = inspect_system()
-            print(json.dumps(info, indent=2))
-            return
+    parser = argparse.ArgumentParser(description="NoGravity 2.1.0 — Antigravity Desktop and CLI local patcher")
+    actions = parser.add_mutually_exclusive_group()
+    for name, short in [("apply", "a"), ("clean", "c"), ("revert", "r"), ("unwatch", "u"), ("watch", "w"), ("diag", "d"), ("status", "s")]:
+        actions.add_argument("--" + name, "-" + short, action="store_true")
+    actions.add_argument("--apply-silent", action="store_true")
+    parser.add_argument("--target", choices=["all", "desktop", "cli"], default="all", help="Installation to patch or restore (default: all found)")
+    args = parser.parse_args()
+    if args.apply or args.apply_silent:
+        sys.exit(0 if apply_targets(args.target, silent=args.apply_silent) else 1)
+    if args.clean:
+        sys.exit(0 if clean_conflicts() else 1)
+    if args.revert:
+        targets = get_targets(args.target)
+        success = bool(targets)
+        for name, path in targets:
+            if not restore_factory_original(path):
+                success = False
+        sys.exit(0 if success else 1)
+    if args.unwatch:
+        sys.exit(0 if remove_watchdog() else 1)
+    if args.watch:
+        sys.exit(0 if install_watchdog() else 1)
+    if args.diag:
+        run_diagnostics()
+        return
+    if args.status:
+        print(json.dumps(inspect_system(args.target), indent=2))
+        return
 
     # Interactive TUI Loop
     while True:
-        info = inspect_system()
+        info = inspect_system(args.target)
         print_banner(info)
 
         wd_action = "Отключить авто-службу Watchdog" if info["watchdog_active"] else "Установить авто-службу Watchdog"
         print(f"""  {BOLD}{WHITE}[ МЕНЮ ДЕЙСТВИЙ ]{RESET}
-  {CYAN}[1]{RESET} {BOLD}Активировать NoGravity{RESET} (Снять геоблок + восстановить нативный прокси)
+  {CYAN}[1]{RESET} {BOLD}Применить локальный патч{RESET} (доступ Google проверяется отдельно)
   {CYAN}[2]{RESET} Очистить конфликты (Остановить сторонние демоны, снять задачи и NRPT)
   {CYAN}[3]{RESET} Заводской откат Antigravity (Восстановить оригинал + удалить авто-службу)
   {CYAN}[4]{RESET} Запустить диагностику Google AI эндпоинтов и сети
@@ -544,14 +639,14 @@ def main():
         choice = input(f"  {BOLD}{WHITE}Выберите пункт [0-5]: {RESET}").strip()
 
         if choice == "1":
-            clean_conflicts()
-            apply_nogravity_patch(clean_first=False)
+            apply_targets(args.target)
             input(f"\n{DIM}Нажмите Enter для продолжения...{RESET}")
         elif choice == "2":
             clean_conflicts()
             input(f"\n{DIM}Нажмите Enter для продолжения...{RESET}")
         elif choice == "3":
-            restore_factory_original()
+            for name, path in get_targets(args.target):
+                restore_factory_original(path)
             input(f"\n{DIM}Нажмите Enter для продолжения...{RESET}")
         elif choice == "4":
             run_diagnostics()
